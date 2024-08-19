@@ -1,23 +1,29 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using TMPro;
+using Unity.VisualScripting;
 using UnityEditor.Build.Content;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.Scripting.APIUpdating;
 
 public class Boid : MonoBehaviour
 {
     public static List<Boid> boidList;
     private Vector3 boundaryCenter;
-    private float boundaryRadius = 1.5f;
+    private float boundaryRadius = 5f;
     private bool turningAround = false;
     private Vector3 vectorBetween, velocityOther, targetPosition;
     private Quaternion targetRotation;
+    
     private Vector3 velocity;
+    private Vector3 prevVelocity;
+    
     private float speed;
 
     private RNNRLAgent agent;
-    private Dictionary<Boid, (Vector3, Vector3, Vector3, float)> neighbors;
+    private Dictionary<Boid, (Vector3, Vector3, Vector3, float, int)> neighbors;
     private float sqrPerceptionRange, sqrMagnitudeTemp;
     public float perceptionRange = 1.0f;
     private Vector3 acceleration, separationForce, alignmentForce, cohesionForce;
@@ -25,28 +31,69 @@ public class Boid : MonoBehaviour
     public float alignmentStrength = 1f;
     public float separationStrength = 1f;
     public float closestDistance = 100; //maybe change
+    private Dictionary<Boid, float> cohesionTimers;
+    public float cohesionDistance = 1.0f;
+    public float maxSpeed = 3.0f;
 
-    // Start is called before the first frame update
+    
+
+    private void Awake()
+    {
+        if (boidList == null)
+            boidList = new List<Boid>();
+        boidList.Add(this);
+        if (neighbors == null)
+            neighbors = new Dictionary<Boid, (Vector3, Vector3, Vector3, float, int)>();
+        cohesionTimers = new Dictionary<Boid, float>();
+    }
+
     void Start()
     {
-        //agent = new RNNRLAgent(8, 10, 3);
+        agent = new RNNRLAgent(10, 10, 3);
         Initialize();
+        InvokeRepeating("RunProgram", 1.0f, 2.0f);
     }
 
     public void Initialize()
     {
         transform.forward = UnityEngine.Random.insideUnitSphere.normalized;
-        speed = UnityEngine.Random.Range(0.1f, 1.5f);
+        speed = UnityEngine.Random.Range(0.1f, 4f);
         velocity = transform.forward * speed;
+        prevVelocity = velocity;
     }
 
     // Update is called once per frame
     void Update()
     {
+        //Debug.Log("here");
+        FindNeighbors();       
         TurnAtBounds();
-        //float[] inputs = new float[] { velocity.x, velocity.y, velocity.z, cohesionForce.x, cohesionForce.y, cohesionForce.z, closestDistance };
-        //float[] output = agent.ForwardPropagation(inputs);
         Move();
+        //kill();
+    }
+
+    public void RunProgram()
+    {
+        //kill();
+        if (!outOfBounds())
+        {
+            GetAverageDirection();
+            GetMassCenterOfNeighbors();
+            GetDistanceToClosestNeighbor();
+            UpdateCohesionTimers();
+            float[] inputs = new float[] { prevVelocity.x, prevVelocity.y, prevVelocity.z, alignmentForce.x, alignmentForce.y, alignmentForce.z, cohesionForce.x, cohesionForce.y, cohesionForce.z, closestDistance };
+            float[] output = agent.ForwardPropagation(inputs);
+
+            prevVelocity = velocity;
+            velocity = new Vector3(output[0], output[1], output[2]);
+            TurnAtBounds();
+        }
+        else
+        {
+            Debug.Log("Out of Bounds");
+            TurnAtBounds();
+            Move();
+        }
     }
     public void SetBoundarySphere(Vector3 center, float radius)
     {
@@ -54,21 +101,57 @@ public class Boid : MonoBehaviour
         boundaryRadius = radius;
     }
 
+    private void UpdateCohesionTimers()
+    {
+        List<Boid> keys = new List<Boid>(cohesionTimers.Keys);
+         // for each boid that currently has a cohesionTime 
+        foreach (Boid other in keys)
+        {
+            float distanceToNeighbor = Mathf.Sqrt(neighbors[other].Item4); // Item4 = Squared Distance
+            if (distanceToNeighbor <= cohesionDistance)
+            {
+                cohesionTimers[other] += Time.deltaTime;
+                Debug.Log($"Cohesion time between {this.gameObject.name} and {other.gameObject.name} is: {cohesionTimers[other]} seconds");
+                if (cohesionTimers[other] >= 3.0f)
+                {
+                    MixAndMutateWeights(other);
+                    cohesionTimers[other] = 0f;
+                }
+            }
+            else
+            {
+                cohesionTimers[other] = 0f;
+            }
+        }
+        // initialize cohesion timer for neighbors not currently in cohesion 
+        foreach (var neighbor in neighbors.Keys)
+        {
+            if (neighbor != this && !cohesionTimers.ContainsKey(neighbor))
+            {
+                cohesionTimers[neighbor] = 0f;
+            }
+        }
+       
+    }
+    private void MixAndMutateWeights(Boid otherBoid)
+    {
+        Debug.Log($"Mutating {this.gameObject.name} with {otherBoid.gameObject.name}");
+    }
+
     private void Move()
     {
-        // Update velocity by (clamped) acceleration
-        //acceleration = Vector3.ClampMagnitude(acceleration, boidSettings.maxAccel);
-        // velocity = Vector3.Lerp(velocity, velocity + acceleration, Time.deltaTime * boidSettings.speed * 2);
-        //velocity += acceleration;
-        velocity = Vector3.ClampMagnitude(velocity, speed);
-        if (velocity.sqrMagnitude <= .1f)
-            velocity = transform.forward * speed;
-        // Update position and rotation
+
+        // Clamp the velocity to ensure it does not exceed the maximum speed
+        velocity = Vector3.ClampMagnitude(velocity, maxSpeed);
         if (velocity != Vector3.zero)
         {
             transform.position += velocity * Time.deltaTime;
             transform.rotation = Quaternion.LookRotation(velocity);
         }
+        // else // if boid is not moving for some reason/ stuck at border
+        // {
+        //     velocity = new Vector3
+        // }
     }
 
     private void TurnAtBounds()
@@ -82,11 +165,11 @@ public class Boid : MonoBehaviour
                 turningAround = true;
             }
             // Keep turning and moving towards targetPosition until targetRotation reached
-            targetRotation = Quaternion.LookRotation(targetPosition - transform.position);
-            //targetRotation = Quaternion.LookRotation(targetPosition); original but changed to above and now works and fish don't go out of bounds so much 
+            //targetRotation = Quaternion.LookRotation(targetPosition - transform.position);
+            targetRotation = Quaternion.LookRotation(targetPosition); //original but changed to above and now works and fish don't go out of bounds so much 
 
-            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * speed);
-            velocity = Vector3.Slerp(velocity, targetPosition - transform.position, Time.deltaTime * speed);
+            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * maxSpeed);
+            velocity = Vector3.Slerp(velocity, targetPosition - transform.position, Time.deltaTime * maxSpeed);
         }
         // After reaching target rotation (within range), stop turning around
         else if (Quaternion.Angle(transform.rotation, targetRotation) <= .01f)
@@ -95,7 +178,7 @@ public class Boid : MonoBehaviour
 
     private void FindNeighbors()
     {
-        neighbors.Clear();
+        //neighbors.Clear();
 
         // SqrMagnitude is a bit faster than Magnitude since it doesn't require sqrt function
         sqrPerceptionRange = perceptionRange * perceptionRange;
@@ -112,8 +195,16 @@ public class Boid : MonoBehaviour
                 // Skip self
                 if (other != this)
                 {
+                    if (neighbors.ContainsKey(other))
+                    {
+                        int count = neighbors[other].Item5 + 1;
+                        neighbors[other] = (other.transform.position, velocityOther, vectorBetween, sqrMagnitudeTemp, count);
+                    }
+                    else
+                    {
+                        neighbors.Add(other, (other.transform.position, velocityOther, vectorBetween, sqrMagnitudeTemp, 0));
+                    }
                     // Store the neighbor Boid as dictionary for fast lookups, with value = a tuple of Vector3 position, velocityOther, vectorBetween, and float of the distance squared.
-                    neighbors.Add(other, (other.transform.position, velocityOther, vectorBetween, sqrMagnitudeTemp));
                 }
             }
         }
@@ -124,7 +215,7 @@ public class Boid : MonoBehaviour
             return;
         else
         {
-            foreach (KeyValuePair<Boid, (Vector3, Vector3, Vector3, float)> item in neighbors)
+            foreach (KeyValuePair<Boid, (Vector3, Vector3, Vector3, float, int)> item in neighbors)
             {
                 alignmentForce += item.Value.Item2; // Sum all neighbor velocities (Item2 == velocity)
             }
@@ -142,7 +233,7 @@ public class Boid : MonoBehaviour
         else
         {
             cohesionForce = Vector3.zero;
-            foreach (KeyValuePair<Boid, (Vector3, Vector3, Vector3, float)> item in neighbors)
+            foreach (KeyValuePair<Boid, (Vector3, Vector3, Vector3, float, int)> item in neighbors)
             {
                 cohesionForce += item.Value.Item1; // Sum all neighbor positions (Item1 == position)
             }
@@ -161,7 +252,7 @@ public class Boid : MonoBehaviour
         else
         {
             float distance = 10000;
-            foreach (KeyValuePair<Boid, (Vector3, Vector3, Vector3, float)> item in neighbors)
+            foreach (KeyValuePair<Boid, (Vector3, Vector3, Vector3, float,int)> item in neighbors)
             {
                 // Adjust range depending on strength
                 if (item.Value.Item4 < distance)  // Item4 == squaredDistance
@@ -173,4 +264,45 @@ public class Boid : MonoBehaviour
         }
         //return 0.0f;
     }
+
+    private void kill(ref Boolean toKill)
+    {
+ /*       foreach (KeyValuePair<Boid, (Vector3, Vector3, Vector3, float, int)> item in neighbors)
+        {
+            if (item.Value.Item5 > 3)  
+            {
+                Debug.Log("killed");
+                neighbors[item.Key] = (item.Value.Item1, item.Value.Item2, item.Value.Item3, item.Value.Item4, 0);
+            }
+            else
+                Debug.Log(item.Value.Item5);
+        }*/
+
+        //get key collection from dictionary into a list to loop through
+        List<Boid> keys = new List<Boid>(neighbors.Keys);
+        foreach (Boid item in keys)
+        {
+            (Vector3, Vector3, Vector3, float, int) curr = neighbors[item];
+            if (curr.Item5 > 3)
+            {
+                Debug.Log("killed");
+                //StartCoroutine(killEffect());
+                toKill = true;
+                neighbors[item] = (curr.Item1, curr.Item2, curr.Item3, curr.Item4, 0);
+            }
+            else
+            {
+                Debug.Log(curr.Item5);
+                toKill = false;
+            }
+
+        }
+    }
+
+    private Boolean outOfBounds()
+    {
+        return ((transform.position - boundaryCenter).sqrMagnitude >= (boundaryRadius * boundaryRadius));
+    }
+
+
 }
